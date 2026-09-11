@@ -17,6 +17,16 @@ if config.SUPABASE_SERVICE_ROLE_KEY:
         st.warning(f"⚠️ Service role non disponible : {str(e)[:100]}")
 
 
+def get_authenticated_client():
+    """Retourne un client Supabase authentifié avec le token de session"""
+    token = st.session_state.get('access_token')
+    if token and isinstance(token, str) and token.strip():
+        client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+        client.postgrest.auth(token)
+        return client
+    return supabase
+
+
 def apply_supabase_auth():
     """Applique le token d'authentification aux requêtes Supabase"""
     try:
@@ -27,32 +37,107 @@ def apply_supabase_auth():
         st.warning(f"⚠️ Erreur d'authentification : {str(e)}")
 
 
+def _fetch_entreprise(user_id, token):
+    """
+    Tente de récupérer l'entreprise en cascade :
+    1. Client authentifié (RLS)
+    2. Client admin (bypass RLS)
+    Retourne le dict ou None.
+    """
+    # Tentative 1 : client avec token
+    try:
+        temp_client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+        temp_client.postgrest.auth(token)
+        result = temp_client.table('entreprises').select("*").eq('user_id', user_id).execute()
+        if result.data:
+            return result.data[0]
+    except Exception:
+        pass
+
+    # Tentative 2 : client admin (bypass RLS)
+    if supabase_admin:
+        try:
+            result = supabase_admin.table('entreprises').select("*").eq('user_id', user_id).execute()
+            if result.data:
+                return result.data[0]
+        except Exception:
+            pass
+
+    return None
+
+
+def login_user(email, password):
+    """Connexion d'un utilisateur"""
+    try:
+        if not email or not password:
+            st.error("❌ Veuillez entrer votre courriel et mot de passe")
+            return False
+
+        session = supabase.auth.sign_in_with_password({"email": email, "password": password})
+
+        if not session or not session.session or not session.session.access_token:
+            st.error("❌ Erreur de connexion. Veuillez vérifier vos identifiants.")
+            return False
+
+        token = session.session.access_token
+        user_id = session.user.id
+
+        st.session_state.access_token = token
+        st.session_state.user_id = user_id
+
+        entreprise = _fetch_entreprise(user_id, token)
+
+        if entreprise:
+            st.session_state.user = entreprise
+            st.session_state.logged_in = True
+            st.session_state.profile_completed = bool(entreprise.get('logo_url'))
+            if 'active_tab' not in st.session_state:
+                st.session_state.active_tab = 0
+            return True
+        else:
+            st.error("❌ Impossible de récupérer les informations de votre profil")
+            st.info("💡 Votre compte existe mais le profil entreprise est introuvable. Contactez le support.")
+            return False
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "email not confirmed" in error_msg or "email_not_confirmed" in error_msg:
+            st.error("📧 Votre courriel n'a pas encore été validé. Vérifiez votre boîte courriel (et les indésirables).")
+        elif "invalid login" in error_msg or "invalid credentials" in error_msg:
+            st.error("❌ Courriel ou mot de passe incorrect")
+        elif "too many requests" in error_msg or "rate limit" in error_msg:
+            st.error("⏱️ Trop de tentatives de connexion. Veuillez patienter quelques minutes.")
+        else:
+            st.error(f"❌ Erreur de connexion : {str(e)}")
+        return False
+
+
 def signup_user(data):
     """Inscription d'un nouvel utilisateur"""
     try:
         if not data.get("numero_neq") or not data.get("licence_rbq"):
             st.error("❌ Le NEQ et la licence RBQ sont obligatoires")
             return False
-        
+
         if not data.get("contact_email") or "@" not in data.get("contact_email", ""):
             st.error("❌ L'adresse courriel est invalide")
             return False
-        
+
         if not data.get("password") or len(data.get("password", "")) < 6:
             st.error("❌ Le mot de passe doit contenir au moins 6 caractères")
             return False
-        
+
         try:
             existing_user = get_user_by_email(data["contact_email"])
             if existing_user:
                 st.error("❌ Cette adresse courriel est déjà utilisée. Veuillez vous connecter.")
                 return False
-        except:
+        except Exception:
             pass
-            
+
         try:
             response = supabase.auth.sign_up({
-                "email": data["contact_email"], 
+                "email": data["contact_email"],
                 "password": data["password"],
                 "options": {
                     "data": {
@@ -70,13 +155,13 @@ def signup_user(data):
                 return False
             else:
                 raise auth_error
-        
+
         if not response.user or not response.user.id:
             st.error("❌ Erreur lors de la création du compte. Veuillez réessayer.")
             return False
-        
+
         user_id = response.user.id
-        
+
         entreprise_data = {
             "nom_entreprise": data["nom_entreprise"],
             "numero_neq": data["numero_neq"],
@@ -94,41 +179,43 @@ def signup_user(data):
         }
 
         insertion_success = False
-        
+
+        # Tentative 1 : avec le token de session (si disponible)
         if response.session and response.session.access_token:
             try:
                 temp_client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
                 temp_client.postgrest.auth(response.session.access_token)
                 result = temp_client.table('entreprises').insert(entreprise_data).execute()
-                
-                if result.data and len(result.data) > 0:
+                if result.data:
                     insertion_success = True
                     try:
                         supabase.auth.sign_out()
-                    except:
+                    except Exception:
                         pass
             except Exception as e:
                 st.warning(f"⚠️ Tentative 1 échouée : {str(e)[:100]}")
-        
+
+        # Tentative 2 : client admin (bypass RLS)
         if not insertion_success and supabase_admin:
             try:
                 result = supabase_admin.table('entreprises').insert(entreprise_data).execute()
-                if result.data and len(result.data) > 0:
+                if result.data:
                     insertion_success = True
             except Exception as e:
                 st.warning(f"⚠️ Tentative 2 échouée : {str(e)[:100]}")
-        
+
+        # Tentative 3 : client global
         if not insertion_success:
             try:
                 result = supabase.table('entreprises').insert(entreprise_data).execute()
-                if result.data and len(result.data) > 0:
+                if result.data:
                     insertion_success = True
             except Exception as e:
-                st.error(f"❌ Toutes les tentatives d'insertion ont échoué")
+                st.error("❌ Toutes les tentatives d'insertion ont échoué")
                 st.info("💡 Votre compte a été créé mais le profil n'a pas pu être enregistré.")
                 st.info("🔧 Veuillez contacter le support avec ce message d'erreur :")
                 st.code(str(e))
-        
+
         return insertion_success
 
     except Exception as e:
@@ -150,70 +237,39 @@ def signup_user(data):
         return False
 
 
-def login_user(email, password):
-    """Connexion d'un utilisateur"""
-    try:
-        if not email or not password:
-            st.error("❌ Veuillez entrer votre courriel et mot de passe")
-            return False
-        
-        session = supabase.auth.sign_in_with_password({"email": email, "password": password})
-        
-        if not session or not session.session or not session.session.access_token:
-            st.error("❌ Erreur de connexion. Veuillez vérifier vos identifiants.")
-            return False
-        
-        token = session.session.access_token
-        st.session_state.access_token = token
-
-        # ✅ Utiliser un client temporaire avec le token frais
-        temp_client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
-        temp_client.postgrest.auth(token)
-        result = temp_client.table('entreprises').select("*").eq('user_id', session.user.id).execute()
-
-        if result.data and len(result.data) > 0:
-            st.session_state.user = result.data[0]
-            st.session_state.logged_in = True
-            st.session_state.profile_completed = bool(st.session_state.user.get('logo_url'))
-            if 'active_tab' not in st.session_state:
-                st.session_state.active_tab = 0
-            return True
-        else:
-            st.error("❌ Impossible de récupérer les informations de votre profil")
-            return False
-            
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "email not confirmed" in error_msg or "email_not_confirmed" in error_msg:
-            st.error("📧 Votre courriel n'a pas encore été validé.")
-        elif "invalid login" in error_msg or "invalid credentials" in error_msg:
-            st.error("❌ Courriel ou mot de passe incorrect")
-        elif "too many requests" in error_msg or "rate limit" in error_msg:
-            st.error("⏱️ Trop de tentatives. Veuillez patienter quelques minutes.")
-        else:
-            st.error(f"❌ Erreur de connexion : {str(e)}")
-        return False
-
-
 def get_user_by_email(email):
     """Récupère un utilisateur par son email"""
     try:
-        result = supabase.table('entreprises').select("*").eq('contact_email', email).execute()
-        return result.data[0] if result.data and len(result.data) > 0 else None
+        # Utilise admin pour bypasser la RLS sur cette vérification
+        client = supabase_admin if supabase_admin else supabase
+        result = client.table('entreprises').select("*").eq('contact_email', email).execute()
+        return result.data[0] if result.data else None
     except Exception as e:
         st.warning(f"⚠️ Erreur lors de la vérification du courriel : {str(e)}")
         return None
 
 
+def update_entreprise(entreprise_id, update_data):
+    """Met à jour les informations d'une entreprise"""
+    try:
+        client = get_authenticated_client()
+        result = client.table('entreprises').update(update_data).eq('id', entreprise_id).execute()
+        if result.data:
+            st.session_state.user = result.data[0]
+            return True
+        return False
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la mise à jour : {str(e)}")
+        return False
+
+
 def add_projet_antecedent(projet_data):
     """Ajoute un projet antérieur"""
     try:
-        apply_supabase_auth()
-        
         if not projet_data.get("nom_projet"):
             st.error("❌ Le nom du projet est obligatoire")
             return False
-        
+
         data = {
             "entreprise_id": st.session_state.user['id'],
             "nom_projet": projet_data["nom_projet"],
@@ -221,7 +277,7 @@ def add_projet_antecedent(projet_data):
             "duree_jours": projet_data.get("duree_jours", 0),
             "specifications": projet_data.get("specifications", "")
         }
-        
+
         if projet_data.get("document"):
             try:
                 from storage import upload_document_projet
@@ -232,16 +288,17 @@ def add_projet_antecedent(projet_data):
                 st.warning("⚠️ Module storage non disponible. Le document ne sera pas uploadé.")
             except Exception as e:
                 st.warning(f"⚠️ Erreur lors de l'upload du document : {str(e)}")
-        
-        result = supabase.table('projets_antecedents').insert(data).execute()
-        
-        if result.data and len(result.data) > 0:
+
+        client = get_authenticated_client()
+        result = client.table('projets_antecedents').insert(data).execute()
+
+        if result.data:
             st.success("✅ Projet ajouté avec succès")
             return True
         else:
             st.error("❌ Erreur lors de l'ajout du projet")
             return False
-            
+
     except Exception as e:
         st.error(f"❌ Erreur lors de l'ajout du projet : {str(e)}")
         return False
@@ -250,8 +307,6 @@ def add_projet_antecedent(projet_data):
 def save_soumission(entreprise_id, soumission_data):
     """Sauvegarde une analyse de soumission"""
     try:
-        apply_supabase_auth()
-        
         data_to_save = {
             "entreprise_id": entreprise_id,
             "numero_projet": soumission_data.get("numero_projet", ""),
@@ -261,7 +316,7 @@ def save_soumission(entreprise_id, soumission_data):
             "score": soumission_data.get("score", 0),
             "statut": soumission_data.get("statut", "en_attente")
         }
-        
+
         if soumission_data.get("document"):
             try:
                 from storage import upload_soumission
@@ -272,14 +327,14 @@ def save_soumission(entreprise_id, soumission_data):
                 pass
             except Exception as e:
                 st.warning(f"⚠️ Document non uploadé : {str(e)}")
-        
-        result = supabase.table('soumissions').insert(data_to_save).execute()
-        
-        if result.data and len(result.data) > 0:
+
+        client = get_authenticated_client()
+        result = client.table('soumissions').insert(data_to_save).execute()
+
+        if result.data:
             return result.data[0]
-        else:
-            return None
-            
+        return None
+
     except Exception as e:
         st.error(f"❌ Erreur lors de la sauvegarde : {str(e)}")
         return None
