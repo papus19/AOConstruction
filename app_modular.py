@@ -1,10 +1,9 @@
 """
 MOKAFAD - Solution Soumission IA
-Application principale v3.7
-Changements vs v3.6 :
-  - Import mes_offres (nouveau module)
-  - Sidebar : ajout mes_offres.show_sidebar_offres(user) après les boutons nav
-  - Onglet tab4 "Mes Offres" : remplacé par mes_offres.show_mes_offres_tab(user)
+Application principale v3.8
+Changements vs v3.7 :
+  - Gestion reset mot de passe (show_reset_password_page / show_new_password_page)
+  - Routage page= dans session_state pour mot de passe oublié
 """
 import streamlit as st
 import config
@@ -46,6 +45,7 @@ for key, default in [
     ('analyse_result',    None),
     ('analyse_texte_ao',  ""),
     ('offre_generee',     None),
+    ('page',              'login'),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -249,15 +249,28 @@ def _show_analyse_avec_callback(user, projets_antecedents):
 
 
 # ════════════════════════════════════════════════════════════════════
-# AUTHENTIFICATION
+# AUTHENTIFICATION & ROUTAGE
 # ════════════════════════════════════════════════════════════════════
 
 if not st.session_state.logged_in:
-    tab1, tab2 = st.tabs(["Connexion", "Inscription"])
-    with tab1:
-        auth.show_login_page()
-    with tab2:
-        auth.show_signup_page()
+
+    page = st.session_state.get('page', 'login')
+
+    # ── Page : Mot de passe oublié ───────────────────────────────
+    if page == "reset_password":
+        auth.show_reset_password_page()
+
+    # ── Page : Nouveau mot de passe (après lien email) ───────────
+    elif page == "new_password":
+        auth.show_new_password_page()
+
+    # ── Page : Connexion / Inscription (défaut) ──────────────────
+    else:
+        tab1, tab2 = st.tabs(["Connexion", "Inscription"])
+        with tab1:
+            auth.show_login_page()
+        with tab2:
+            auth.show_signup_page()
 
 elif not st.session_state.profile_completed:
     profile.show_profile_completion()
@@ -327,9 +340,6 @@ else:
         active = st.session_state.get("sidebar_section", "dashboard")
         st.caption(f"Vue active : **{labels.get(active, active)}**")
 
-        # ── Modèle LLM — lu depuis session_state (mis à jour par analyse.py) ──
-        # Affiché uniquement après une analyse — pas de fallback sur provider_actif()
-        # pour éviter d'afficher Gemini alors que c'est Groq qui a répondu.
         llm_actif = st.session_state.get("llm_dernier_provider")
         if llm_actif:
             st.caption(f"🤖 Modèle IA : `{llm_actif}`")
