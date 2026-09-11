@@ -163,11 +163,14 @@ def login_user(email, password):
             st.error("❌ Erreur de connexion. Veuillez vérifier vos identifiants.")
             return False
         
-        st.session_state.access_token = session.session.access_token
-        apply_supabase_auth()
+        token = session.session.access_token
+        st.session_state.access_token = token
 
-        result = supabase.table('entreprises').select("*").eq('contact_email', email).execute()
-        
+        # ✅ Utiliser un client temporaire avec le token frais
+        temp_client = create_client(config.SUPABASE_URL, config.SUPABASE_ANON_KEY)
+        temp_client.postgrest.auth(token)
+        result = temp_client.table('entreprises').select("*").eq('user_id', session.user.id).execute()
+
         if result.data and len(result.data) > 0:
             st.session_state.user = result.data[0]
             st.session_state.logged_in = True
@@ -182,11 +185,11 @@ def login_user(email, password):
     except Exception as e:
         error_msg = str(e).lower()
         if "email not confirmed" in error_msg or "email_not_confirmed" in error_msg:
-            st.error("📧 Votre courriel n'a pas encore été validé. Veuillez cliquer sur le lien dans le courriel de confirmation que nous vous avons envoyé. Pensez à vérifier dans vos courriels indésirables (spam).")
+            st.error("📧 Votre courriel n'a pas encore été validé.")
         elif "invalid login" in error_msg or "invalid credentials" in error_msg:
             st.error("❌ Courriel ou mot de passe incorrect")
         elif "too many requests" in error_msg or "rate limit" in error_msg:
-            st.error("⏱️ Trop de tentatives de connexion. Veuillez patienter quelques minutes.")
+            st.error("⏱️ Trop de tentatives. Veuillez patienter quelques minutes.")
         else:
             st.error(f"❌ Erreur de connexion : {str(e)}")
         return False
