@@ -1,8 +1,15 @@
 """
-Gestion des fournisseurs LLM — Version 3.0
+Gestion des fournisseurs LLM — Version 3.1
 Ordre de priorité : Gemini → Groq → Mistral → OpenRouter → Cohere → OpenAI
 Tous gratuits (sauf OpenAI — dernier recours)
 Gestion explicite 429 avec fallback automatique silencieux
+
+Modèles mis à jour le 2026-09-18 :
+  - Gemini   : gemini-2.0-flash-exp (arrêté 2026-06-01) -> gemini-3.5-flash
+  - Groq     : llama-3.3-70b-versatile (décommissionné 2026-08-16) -> openai/gpt-oss-120b
+  - Cohere   : command-r-plus-08-2024 (dépassé) -> command-a-03-2025
+  - OpenAI   : gpt-4o (retiré/snapshot expirant 2026-10-23) -> gpt-5.5
+  - Mistral et OpenRouter : inchangés, toujours d'actualité
 """
 import requests
 import config
@@ -15,32 +22,32 @@ class LLMManager:
         self._init_providers()
 
     def _init_providers(self):
-    
-        # 2️⃣ Groq — 14 400 req/jour, ultra-rapide
+
+        # 2️⃣ Groq — modèle Llama 3.3 décommissionné le 16/08/2026, remplacé par GPT-OSS 120B
         if getattr(config, "GROQ_API_KEY", None):
             self.providers.append({
-                "name":    "Groq LLaMA 3.3 70B",
+                "name":    "Groq GPT-OSS 120B",
                 "api_key": config.GROQ_API_KEY,
                 "type":    "groq",
                 "url":     "https://api.groq.com/openai/v1/chat/completions",
-                "model":   "llama-3.3-70b-versatile"
+                "model":   "openai/gpt-oss-120b"
             })
 
-        # 1️⃣ Gemini (Google AI Studio) — ~1000 req/jour, contexte 1M tokens
+        # 1️⃣ Gemini (Google AI Studio) — gemini-2.0-flash-exp arrêté, on passe à Gemini 3.5 Flash
         if getattr(config, "GEMINI_API_KEY", None):
             try:
                 import google.generativeai as genai
                 genai.configure(api_key=config.GEMINI_API_KEY)
-                model = genai.GenerativeModel("gemini-2.0-flash-exp")
+                model = genai.GenerativeModel("gemini-3.5-flash")
                 self.providers.append({
-                    "name":   "Gemini 2.0 Flash",
+                    "name":   "Gemini 3.5 Flash",
                     "client": model,
                     "type":   "gemini"
                 })
             except Exception as e:
                 print(f"[LLM] Gemini non disponible : {str(e)[:100]}")
 
-        # 3️⃣ Mistral — 1 milliard tokens/mois, fort en français
+        # 3️⃣ Mistral — alias "latest" toujours valide (pointe vers Mistral Small 4)
         if getattr(config, "MISTRAL_API_KEY", None):
             self.providers.append({
                 "name":    "Mistral Small",
@@ -50,7 +57,7 @@ class LLMManager:
                 "model":   "mistral-small-latest"
             })
 
-        # 4️⃣ OpenRouter — 50 req/jour, 24+ modèles gratuits (filet de sécurité)
+        # 4️⃣ OpenRouter — toujours disponible gratuitement (filet de sécurité)
         if getattr(config, "OPENROUTER_API_KEY", None):
             self.providers.append({
                 "name":    "OpenRouter (DeepSeek R1)",
@@ -64,24 +71,24 @@ class LLMManager:
                 }
             })
 
-        # 5️⃣ Cohere — 1000 req/mois, excellent en français
+        # 5️⃣ Cohere — command-r-plus-08-2024 dépassé, migration vers Command A (fort en français)
         if getattr(config, "COHERE_API_KEY", None):
             self.providers.append({
-                "name":    "Cohere Command R+",
+                "name":    "Cohere Command A",
                 "api_key": config.COHERE_API_KEY,
                 "type":    "cohere",
                 "url":     "https://api.cohere.com/v2/chat",
-                "model":   "command-r-plus-08-2024"
+                "model":   "command-a-03-2025"
             })
 
-        # 6️⃣ OpenAI — Dernier recours (payant)
+        # 6️⃣ OpenAI — Dernier recours (payant), gpt-4o remplacé par le modèle frontière actuel
         if getattr(config, "OPENAI_API_KEY", None):
             self.providers.append({
-                "name":    "OpenAI GPT-4o",
+                "name":    "OpenAI GPT-5.5",
                 "api_key": config.OPENAI_API_KEY,
                 "type":    "openai_compat",
                 "url":     "https://api.openai.com/v1/chat/completions",
-                "model":   "gpt-4o"
+                "model":   "gpt-5.5"
             })
 
         if not self.providers:
