@@ -107,11 +107,28 @@ def _upload_vers_storage(nom: str, contenu: bytes, entreprise_id: str) -> str | 
         f"{config.SUPABASE_URL}/storage/v1",
         {"apiKey": key, "Authorization": f"Bearer {key}"},
     )
-    storage.from_("documents").upload(
-        path=file_name,
-        file=contenu,
-        file_options={"content-type": content_type, "upsert": "true"},
-    )
+
+    def _do_upload(mime: str):
+        storage.from_("documents").upload(
+            path=file_name,
+            file=contenu,
+            file_options={"content-type": mime, "upsert": "true"},
+        )
+
+    try:
+        _do_upload(content_type)
+    except Exception as e:
+        # Fix : certains formats binaires (.xls, .doc, .dwg…) sont mal
+        # reconnus par le sniffing de type de Supabase Storage, qui compare
+        # les octets réels du fichier au content-type déclaré et rejette en
+        # 415 "invalid_mime_type" en cas de mismatch — même si le bucket
+        # n'a lui-même aucune restriction MIME configurée. On retente alors
+        # avec un type générique, toujours accepté.
+        if "invalid_mime_type" in str(e) or "415" in str(e):
+            _do_upload("application/octet-stream")
+        else:
+            raise
+
     url = storage.from_("documents").get_public_url(file_name)
     if not url:
         raise RuntimeError(f"Upload storage réussi mais URL publique vide pour {file_name}")
