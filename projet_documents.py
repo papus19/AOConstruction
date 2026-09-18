@@ -5,6 +5,7 @@ Extraction multi-méthode : pdfplumber → pypdf → OCR (tesseract)
 """
 
 import io
+import re
 import streamlit as st
 
 # ── Imports extraction ──────────────────────────────────────────────────────
@@ -204,6 +205,13 @@ def _init():
             cat: {"fichiers": [], "texte_combine": ""}
             for cat in CATEGORIES
         }
+    if "plans_architecture" not in st.session_state:
+        st.session_state["plans_architecture"] = {
+            "pdf_bytes":     None,
+            "nom_source":    "",
+            "pages":         [],
+            "texte_combine": "",
+        }
 
 
 def get_texte(cat: str) -> str:
@@ -268,6 +276,300 @@ def texte_ao_complet() -> str:
     if brd.strip():
         parties.append(f"=== BORDEREAU DE PRIX ===\n{brd}")
     return "\n\n".join(parties)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ─── Extraction des plans d'architecture depuis un PDF multi-disciplines ────
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Les cahiers de plans de construction regroupent généralement plusieurs
+# disciplines dans un même PDF (architecture, structure, mécanique/CVAC,
+# électrique, civil, plomberie). Chaque page porte en général :
+#   - un numéro de plan normalisé (ex: A-101, A1.02, ARCH-03 pour l'archi ;
+#     S-1, STR-201 pour la structure ; E-101 pour l'électrique ; etc.)
+#   - et/ou un cartouche mentionnant explicitement la discipline
+#     ("ARCHITECTURE", "PLAN D'ARCHITECTURE", "ARCH.", etc.)
+#
+# On classe donc chaque page par mots-clés + préfixes de numérotation,
+# puis on reconstruit un PDF ne contenant que les pages "architecture".
+
+# Discipline → (regex numéro de plan, regex mots-clés de cartouche)
+_DISCIPLINES_PATTERNS = {
+    "architecture": {
+        "numero":  re.compile(r"\b(?:A|ARCH)[\s\-\.]?\d{1,3}(?:[\.\-]\d{1,2})?\b", re.IGNORECASE),
+        "mots_cles": re.compile(
+            r"\b(ARCHITECTURE|ARCHITECTURAL|PLAN\s+D['’]ARCHITECTURE|ARCH\.)\b",
+            re.IGNORECASE,
+        ),
+    },
+    "structure": {
+        "numero":  re.compile(r"\b(?:S|STR)[\s\-\.]?\d{1,3}(?:[\.\-]\d{1,2})?\b", re.IGNORECASE),
+        "mots_cles": re.compile(r"\b(STRUCTURE|STRUCTURAL|CHARPENTE)\b", re.IGNORECASE),
+    },
+    "electrique": {
+        "numero":  re.compile(r"\b(?:E|ELEC)[\s\-\.]?\d{1,3}(?:[\.\-]\d{1,2})?\b", re.IGNORECASE),
+        "mots_cles": re.compile(r"\b(ÉLECTRI[A-Z]*|ELECTRI[A-Z]*)\b", re.IGNORECASE),
+    },
+    "mecanique": {
+        "numero":  re.compile(r"\b(?:M|MEC|CVAC|HVAC)[\s\-\.]?\d{1,3}(?:[\.\-]\d{1,2})?\b", re.IGNORECASE),
+        "mots_cles": re.compile(r"\b(MÉCANIQUE|MECANIQUE|CVAC|VENTILATION|PLOMBERIE)\b", re.IGNORECASE),
+    },
+    "civil": {
+        "numero":  re.compile(r"\b(?:C|CIV)[\s\-\.]?\d{1,3}(?:[\.\-]\d{1,2})?\b", re.IGNORECASE),
+        "mots_cles": re.compile(r"\b(CIVIL|ARPENTAGE|AMÉNAGEMENT\s+EXTÉRIEUR)\b", re.IGNORECASE),
+    },
+}
+
+DISCIPLINE_LABELS = {
+    "architecture": "🏛️ Architecture",
+    "structure":    "🏗️ Structure",
+    "electrique":   "⚡ Électrique",
+    "mecanique":    "🔧 Mécanique / CVAC",
+    "civil":        "🌍 Civil",
+}
+
+
+def _texte_page_pdf(file_bytes: bytes, index: int) -> str:
+    """Extrait le texte d'une seule page (0-indexée). Tente pdfplumber puis pypdf."""
+    if _PDFPLUMBER:
+        try:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                if index < len(pdf.pages):
+                    t = pdf.pages[index].extract_text() or ""
+                    if t.strip():
+                        return t
+        except Exception:
+            pass
+    if _PYPDF:
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+            if index < len(reader.pages):
+                t = reader.pages[index].extract_text() or ""
+                if t.strip():
+                    return t
+        except Exception:
+            pass
+    return ""
+
+
+def _texte_page_ocr(file_bytes: bytes, index: int) -> str:
+    """OCR ciblé sur une seule page — utilisé seulement si le texte natif est vide
+    (cas fréquent pour les plans, souvent constitués d'images vectorielles/scans)."""
+    if not _OCR:
+        return ""
+    try:
+        images = convert_from_bytes(
+            file_bytes, dpi=200, first_page=index + 1, last_page=index + 1
+        )
+        if images:
+            return pytesseract.image_to_string(images[0], lang="fra+eng")
+    except Exception:
+        pass
+    return ""
+
+
+def _classifier_page(texte: str) -> str | None:
+    """
+    Détermine la discipline d'une page à partir de son texte (cartouche + numéro de plan).
+    Retourne le nom de la discipline la mieux supportée, ou None si rien ne correspond.
+    """
+    if not texte.strip():
+        return None
+
+    scores = {}
+    for discipline, patt in _DISCIPLINES_PATTERNS.items():
+        score = 0
+        if patt["mots_cles"].search(texte):
+            score += 2          # le cartouche explicite est plus fiable
+        if patt["numero"].search(texte):
+            score += 1
+        if score:
+            scores[discipline] = score
+
+    if not scores:
+        return None
+    # En cas d'égalité, priorité aux mots-clés explicites déjà pondérés dans le score
+    return max(scores, key=scores.get)
+
+
+def extraire_pages_par_discipline(
+    file_bytes: bytes,
+    discipline: str = "architecture",
+    utiliser_ocr_si_vide: bool = True,
+    progress_callback=None,
+) -> dict:
+    """
+    Parcourt toutes les pages d'un PDF de plans mélangés et isole celles qui
+    correspondent à la discipline demandée (par défaut : architecture).
+
+    Retourne un dict :
+        {
+            "pdf_bytes":     bytes du PDF reconstitué (pages archi uniquement) ou None,
+            "pages":         liste des numéros de page d'origine détectés (1-indexée),
+            "texte_combine": texte extrait des pages retenues,
+            "nb_pages_total": nombre total de pages du PDF source,
+        }
+    """
+    resultat = {
+        "pdf_bytes":      None,
+        "pages":          [],
+        "texte_combine":  "",
+        "nb_pages_total": 0,
+    }
+
+    if not _PYPDF:
+        return resultat
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    except Exception:
+        return resultat
+
+    nb_pages = len(reader.pages)
+    resultat["nb_pages_total"] = nb_pages
+
+    pages_retenues = []
+    textes_retenus = []
+
+    for i in range(nb_pages):
+        if progress_callback:
+            progress_callback((i + 1) / nb_pages, i + 1, nb_pages)
+
+        texte = _texte_page_pdf(file_bytes, i)
+        if not texte.strip() and utiliser_ocr_si_vide:
+            texte = _texte_page_ocr(file_bytes, i)
+
+        classe = _classifier_page(texte)
+        if classe == discipline:
+            pages_retenues.append(i + 1)   # 1-indexé pour l'affichage
+            if texte.strip():
+                textes_retenus.append(f"--- Page {i + 1} ---\n{texte.strip()}")
+
+    resultat["pages"]         = pages_retenues
+    resultat["texte_combine"] = "\n\n".join(textes_retenus)
+
+    if pages_retenues:
+        writer = pypdf.PdfWriter()
+        for num_page in pages_retenues:
+            writer.add_page(reader.pages[num_page - 1])
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        resultat["pdf_bytes"] = buffer.getvalue()
+
+    return resultat
+
+
+def plans_architecture_texte() -> str:
+    """Texte des plans d'architecture actuellement isolés (si extraction déjà lancée)."""
+    _init()
+    return st.session_state["plans_architecture"].get("texte_combine", "")
+
+
+def plans_architecture_bytes():
+    """PDF (bytes) des plans d'architecture isolés, ou None si pas encore extraits."""
+    _init()
+    return st.session_state["plans_architecture"].get("pdf_bytes")
+
+
+# ─── UI : section d'extraction des plans d'architecture ──────────────────────
+
+def _show_extraction_plans_architecture(key_prefix: str):
+    """
+    Section UI permettant de choisir un PDF déjà chargé (généralement dans
+    'cahier_charges' ou 'autres', là où se trouvent les cahiers de plans),
+    puis d'en extraire uniquement les pages identifiées comme des plans
+    d'architecture (par numéro de plan et/ou mention de cartouche).
+    """
+    _init()
+
+    # PDFs candidats : tous les fichiers .pdf déjà chargés, toutes catégories confondues
+    pdfs_disponibles = []
+    for cat in CATEGORIES:
+        for f in get_fichiers(cat):
+            if f.get("nom", "").lower().endswith(".pdf") and f.get("bytes"):
+                pdfs_disponibles.append((cat, f))
+
+    with st.expander("🏛️ **Isoler les plans d'architecture** *(à partir d'un PDF multi-disciplines)*"):
+        st.caption(
+            "Sélectionnez un cahier de plans (PDF contenant plusieurs disciplines mélangées — "
+            "architecture, structure, électrique, mécanique, civil). L'outil détecte les pages "
+            "d'architecture via leur numéro de plan (ex. A-101) et/ou la mention dans le cartouche, "
+            "puis génère un PDF ne contenant que ces pages."
+        )
+
+        if not pdfs_disponibles:
+            st.info("Aucun PDF chargé pour l'instant. Ajoutez d'abord un cahier de plans ci-dessus.")
+            return
+
+        options = [f"{meta['label'] if (meta:=CATEGORIES[cat]) else cat} — {f['nom']}"
+                   for cat, f in pdfs_disponibles]
+        idx_choisi = st.selectbox(
+            "PDF source",
+            options=range(len(pdfs_disponibles)),
+            format_func=lambda i: options[i],
+            key=f"{key_prefix}_archi_select_pdf",
+        )
+        cat_choisie, fichier_choisi = pdfs_disponibles[idx_choisi]
+
+        discipline_choisie = st.selectbox(
+            "Discipline à extraire",
+            options=list(DISCIPLINE_LABELS.keys()),
+            format_func=lambda d: DISCIPLINE_LABELS[d],
+            index=0,   # "architecture" par défaut
+            key=f"{key_prefix}_archi_select_discipline",
+        )
+
+        if st.button("🔍 Lancer l'extraction", key=f"{key_prefix}_archi_run"):
+            progress = st.progress(0, text="Analyse des pages…")
+
+            def _cb(frac, page_courante, total):
+                progress.progress(frac, text=f"Page {page_courante}/{total}…")
+
+            res = extraire_pages_par_discipline(
+                fichier_choisi["bytes"],
+                discipline=discipline_choisie,
+                utiliser_ocr_si_vide=True,
+                progress_callback=_cb,
+            )
+            progress.empty()
+
+            if discipline_choisie == "architecture":
+                st.session_state["plans_architecture"] = {
+                    "pdf_bytes":     res["pdf_bytes"],
+                    "nom_source":    fichier_choisi["nom"],
+                    "pages":         res["pages"],
+                    "texte_combine": res["texte_combine"],
+                }
+
+            if res["pages"]:
+                st.success(
+                    f"✅ {len(res['pages'])} page(s) sur {res['nb_pages_total']} identifiée(s) "
+                    f"comme « {DISCIPLINE_LABELS[discipline_choisie]} » : "
+                    f"{', '.join(str(p) for p in res['pages'])}"
+                )
+                if res["pdf_bytes"]:
+                    st.download_button(
+                        "⬇️ Télécharger le PDF extrait",
+                        data=res["pdf_bytes"],
+                        file_name=f"{discipline_choisie}_{fichier_choisi['nom']}",
+                        mime="application/pdf",
+                        key=f"{key_prefix}_archi_download",
+                    )
+            else:
+                st.warning(
+                    "⚠️ Aucune page n'a pu être identifiée pour cette discipline. "
+                    "Le document ne contient peut-être pas de cartouche standard, "
+                    "ou les plans sont des images sans OCR exploitable."
+                )
+
+        # ── Affichage de l'extraction archi déjà en mémoire ─────────────────
+        etat_archi = st.session_state["plans_architecture"]
+        if etat_archi.get("pdf_bytes"):
+            st.markdown("---")
+            st.caption(
+                f"📌 Dernière extraction en mémoire : {len(etat_archi['pages'])} page(s) "
+                f"depuis *{etat_archi['nom_source']}*"
+            )
 
 
 # ─── UI ──────────────────────────────────────────────────────────────────────
@@ -400,11 +702,21 @@ def show_chargement_documents(key_prefix: str = "docs") -> bool:
                     _invalider_derives()
                     st.rerun()
 
+    # ── Extraction ciblée des plans d'architecture ─────────────────────────
+    st.markdown("---")
+    _show_extraction_plans_architecture(key_prefix)
+
     # ── Réinitialisation globale ──────────────────────────────────────────
     st.markdown("---")
     if st.button("🔄 Réinitialiser tous les documents", key=f"{key_prefix}_reset_all"):
         st.session_state["docs_projet"] = {
             cat: {"fichiers": [], "texte_combine": ""} for cat in CATEGORIES
+        }
+        st.session_state["plans_architecture"] = {
+            "pdf_bytes":     None,
+            "nom_source":    "",
+            "pages":         [],
+            "texte_combine": "",
         }
         _invalider_derives()
         st.success("✅ Réinitialisé.")
