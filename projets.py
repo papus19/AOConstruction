@@ -1,6 +1,8 @@
 """
-Gestion des projets — v2.3
+Gestion des projets — v2.4
 Fix : RLS corrigée dans Supabase + storage3 direct pour upload
+Fix v2.4 : validation explicite de l'insertion en base (plus d'échec silencieux)
+           + les messages de résultat survivent au st.rerun()
 """
 
 import datetime
@@ -92,6 +94,15 @@ def _upload_vers_storage(nom: str, contenu: bytes, entreprise_id: str) -> str | 
     content_type = _content_type(nom)
 
     key = config.SUPABASE_SERVICE_ROLE_KEY or config.SUPABASE_ANON_KEY
+    if not config.SUPABASE_SERVICE_ROLE_KEY:
+        # Sans clé service_role, les policies RLS du bucket "documents" peuvent
+        # bloquer l'upload silencieusement selon leur configuration.
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY manquante dans la config — "
+            "l'upload utilise la clé anonyme, qui peut être bloquée par les "
+            "policies RLS du bucket 'documents'."
+        )
+
     storage = SyncStorageClient(
         f"{config.SUPABASE_URL}/storage/v1",
         {"apiKey": key, "Authorization": f"Bearer {key}"},
@@ -102,7 +113,9 @@ def _upload_vers_storage(nom: str, contenu: bytes, entreprise_id: str) -> str | 
         file_options={"content-type": content_type, "upsert": "true"},
     )
     url = storage.from_("documents").get_public_url(file_name)
-    return url or None
+    if not url:
+        raise RuntimeError(f"Upload storage réussi mais URL publique vide pour {file_name}")
+    return url
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,12 +196,27 @@ def _supprimer_projet(projet_id: str) -> bool:
 
 
 def _inserer_document_bd(projet_id: str, entreprise_id: str, nom: str, url: str, taille: int):
-    """Insert dans projet_documents avec service_role key — contourne RLS."""
+    """
+    Insert dans projet_documents avec service_role key — contourne RLS.
+
+    IMPORTANT (fix v2.4) : on vérifie maintenant explicitement que la ligne a
+    bien été créée. Avant ce fix, un insert silencieusement vide (RLS, schéma
+    PostgREST non rechargé, etc.) n'était jamais détecté : la fonction se
+    terminait "normalement" sans lever d'exception, donc l'appelant comptait
+    le document comme "enregistré" alors que rien n'existait en base — d'où
+    le compteur '0 docs' malgré un upload apparemment réussi.
+    """
     import config
     from postgrest import SyncPostgrestClient
 
-    key = config.SUPABASE_SERVICE_ROLE_KEY or config.SUPABASE_ANON_KEY
-    pg  = SyncPostgrestClient(
+    key = config.SUPABASE_SERVICE_ROLE_KEY
+    if not key:
+        raise RuntimeError(
+            "SUPABASE_SERVICE_ROLE_KEY manquante — l'insertion dans "
+            "'projet_documents' nécessite cette clé pour contourner la RLS."
+        )
+
+    pg = SyncPostgrestClient(
         base_url=f"{config.SUPABASE_URL}/rest/v1",
         headers={
             "apikey":        key,
@@ -203,7 +231,16 @@ def _inserer_document_bd(projet_id: str, entreprise_id: str, nom: str, url: str,
         "document_url":  url,
         "taille_bytes":  taille,
     }).execute()
-    print(f"[BD] Insert : {result.data}")
+
+    # ── Validation explicite (c'était le trou avant ce fix) ──────────────
+    if not result.data:
+        raise RuntimeError(
+            f"L'insertion de '{nom}' dans projet_documents n'a retourné "
+            f"aucune ligne — vérifiez les policies RLS de la table et que "
+            f"le schéma PostgREST est à jour (Supabase Studio → API → "
+            f"'Reload schema')."
+        )
+    return result.data[0]
 
 
 def _supprimer_document(doc_id: str, doc_url: str) -> bool:
@@ -233,22 +270,24 @@ def _supprimer_document(doc_id: str, doc_url: str) -> bool:
 # UPLOAD DEPUIS CACHE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _uploader_depuis_cache(projet_id: str, entreprise_id: str, cache: list) -> tuple[int, int]:
-    ok, ko = 0, 0
+def _uploader_depuis_cache(projet_id: str, entreprise_id: str, cache: list) -> dict:
+    """
+    Retourne un résumé détaillé (au lieu d'un simple tuple ok/ko) pour que
+    le message affiché après le rerun contienne le VRAI détail de chaque
+    échec, plutôt qu'un compteur silencieux.
+    """
+    resume = {"ok": [], "erreurs": []}
     for item in cache:
         nom     = item["nom"]
         contenu = item["bytes"]
         taille  = item["size"]
         try:
             url = _upload_vers_storage(nom, contenu, entreprise_id)
-            if not url:
-                raise ValueError("URL vide")
             _inserer_document_bd(projet_id, entreprise_id, nom, url, taille)
-            ok += 1
+            resume["ok"].append(nom)
         except Exception as e:
-            st.warning(f"⚠️ {nom} : {e}")
-            ko += 1
-    return ok, ko
+            resume["erreurs"].append(f"{nom} : {e}")
+    return resume
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -304,6 +343,27 @@ def _afficher_documents(projet: dict, entreprise_id: str):
     st.markdown(_CSS, unsafe_allow_html=True)
     docs = projet.get("projet_documents") or []
     pid  = str(projet["id"])
+
+    # ── Afficher le résultat du dernier upload (survit au st.rerun()) ───────
+    # Fix v2.4 : avant, st.success()/st.error() étaient appelés juste avant
+    # st.rerun(), donc disparaissaient avant que l'utilisateur puisse les
+    # lire. On stocke maintenant le résultat en session_state, on l'affiche
+    # ici au prochain run, puis on le supprime pour ne pas le réafficher.
+    resultat_key = f"upload_resultat_{pid}"
+    dernier_resultat = st.session_state.pop(resultat_key, None)
+    if dernier_resultat:
+        if dernier_resultat["ok"]:
+            st.success(
+                f"✅ {len(dernier_resultat['ok'])} document(s) enregistré(s) : "
+                + ", ".join(dernier_resultat["ok"])
+            )
+        if dernier_resultat["erreurs"]:
+            st.error(
+                f"❌ {len(dernier_resultat['erreurs'])} document(s) en erreur — "
+                "le document n'a PAS été sauvegardé pour ceux-ci :"
+            )
+            for err in dernier_resultat["erreurs"]:
+                st.code(err, language=None)
 
     st.markdown(f"**📁 Documents du projet** ({len(docs)})")
 
@@ -390,11 +450,10 @@ def _afficher_documents(projet: dict, entreprise_id: str):
 
     if enregistrer and cache:
         with st.spinner("Enregistrement en cours…"):
-            ok, ko = _uploader_depuis_cache(pid, entreprise_id, cache)
-        if ok:
-            st.success(f"✅ {ok} document(s) enregistré(s) !")
-        if ko:
-            st.error(f"❌ {ko} document(s) en erreur")
+            resultat = _uploader_depuis_cache(pid, entreprise_id, cache)
+        # On stocke le résultat pour l'afficher au PROCHAIN run (après le
+        # rerun ci-dessous), au lieu de l'afficher maintenant pour rien.
+        st.session_state[resultat_key] = resultat
         st.session_state.pop(upload_key, None)
         st.session_state.pop(cache_key, None)
         st.rerun()
@@ -408,6 +467,15 @@ def show_projets_tab(user):
     st.markdown(_CSS, unsafe_allow_html=True)
     st.header("🏗️ Projets")
     st.caption("Chaque projet est un dossier. Ajoutez-y des documents — l'IA s'en sert pour enrichir les analyses.")
+
+    import config
+    if not config.SUPABASE_SERVICE_ROLE_KEY:
+        st.warning(
+            "⚠️ **SUPABASE_SERVICE_ROLE_KEY** n'est pas configurée. "
+            "L'upload de documents (Storage + table `projet_documents`) en a besoin "
+            "pour contourner la RLS — sans elle, les documents chargés ne seront "
+            "**pas enregistrés**, même si l'interface ne signale rien."
+        )
 
     entreprise_id = str(user["id"])
 
